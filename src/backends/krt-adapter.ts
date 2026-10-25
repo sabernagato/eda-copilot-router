@@ -39,12 +39,12 @@ export type KrtMatchedGroup =
   | readonly string[]
   | { nets: readonly string[] }
 
-/** Exact argparse choices in KiCadRoutingTools 0.22.0. */
+/** Exact argparse choices in KiCadRoutingTools 0.23.7. */
 export const KRT_RIPUP_BLOCKER_SELECT_CHOICES = Object.freeze([
   "count", "near-target", "bidir", "mincut", "cost",
 ] as const)
 
-/** Exact route.py argparse choices in KiCadRoutingTools 0.22.0. */
+/** Exact route.py argparse choices in KiCadRoutingTools 0.23.7. */
 export const KRT_RIPUP_ABANDON_METRIC_CHOICES = Object.freeze([
   "stranded", "total-pads", "complete-nets", "congestion",
   "history", "weighted", "probe", "weighted-probe",
@@ -317,10 +317,10 @@ export type KrtProcessResult = {
   protectedNets?: string[]
   /** Independent board-semantic length audit for the selected matched groups. */
   matchedGroupsAuditPath?: string
-  /** KRT 0.22.0 route.py --json-out artifact with merged reconciliation state. */
+  /** KRT 0.23.7 route.py --json-out artifact with merged reconciliation state. */
   mergedSummaryPath?: string
   jsonSummary?: Record<string, unknown>
-  /** Compact authoritative verdict emitted once by KRT 0.22.0 route.py. */
+  /** Compact authoritative verdict emitted once by KRT 0.23.7 route.py. */
   jsonSummaryMin?: Record<string, unknown>
   jsonSummaries: Record<string, unknown>[]
   diagnostics: KrtDiagnostic[]
@@ -712,7 +712,7 @@ function pointDistance(left: readonly [number, number], right: readonly [number,
 }
 
 /**
- * Match KRT 0.22.0's `_arc_to_segments(..., chord_eps=0.005)` measurement.
+ * Match KRT 0.23.7's `_arc_to_segments(..., chord_eps=0.005)` measurement.
  * Native output is linear, but inherited KiCad arcs must contribute exactly as
  * they do to KRT's own `net_copper_length()` semantic.
  */
@@ -804,7 +804,7 @@ function viaBarrelLength(node: SExpression[], layers: readonly { name: string; t
 /**
  * Independently measure the intended KRT length metric (planar copper plus
  * via barrels) from the final board. The S-expression stackup reader is
- * deliberately stricter than KRT 0.22.0's line-oriented parser, so compact
+ * deliberately stricter than KRT 0.23.7's line-oriented parser, so compact
  * host-generated stackups still receive their physically real barrel length.
  */
 async function measureKrtNetCopperLengths(
@@ -1243,7 +1243,7 @@ function parseJsonSummaries(stdout: string, diagnostics: KrtDiagnostic[]) {
   return summaries
 }
 
-/** Parse KRT 0.22.0's one-per-outer-run compact merged verdict. */
+/** Parse KRT 0.23.7's one-per-outer-run compact merged verdict. */
 export function parseKrtJsonSummaryMin(stdout: string): Record<string, unknown> | undefined {
   const values: Record<string, unknown>[] = []
   for (const line of stdout.split(/\r?\n/)) {
@@ -2088,7 +2088,7 @@ function commonArgs(
 ) {
   const args = [resolve(inputBoard), resolve(outputBoard)]
   args.push("--layers", ...unique(spec.layers))
-  // KRT 0.22 uses --clearance for the Default class only. Special calls pass
+  // KRT 0.23 uses --clearance for the Default class only. Special calls pass
   // their compiled clearance; ordinary groups inherit every project class.
   // Never pass --clearance-ceiling: it would weaken stricter classes.
   if (!options.omitDefaultClearance) args.push("--clearance", numberArg(spec.rules.clearance))
@@ -2428,7 +2428,7 @@ async function executeStage(
     }
 
     // route.py may emit a run-scope summary followed by a reconciliation
-    // subset. KRT 0.22.0 owns their state/effort merge and exposes the result
+    // subset. KRT 0.23.7 owns their state/effort merge and exposes the result
     // through --json-out; consuming that file avoids reimplementing upstream's
     // scope semantics in TypeScript. route_diff.py and qfn_fanout.py retain
     // their existing single-summary contracts.

@@ -1,11 +1,27 @@
-"""Make native KiCad filled copper a net-aware KRT obstacle.
+"""Copilot Router policy on top of KiCad Routing Tools 0.23.7.
 
-KRT parses zone outlines for connectivity, but its ordinary maze map
-does not stamp the actual ``filled_polygon`` copper.  This packaged patch uses
-the already-refilled board written by the host and augments KRT's existing
-per-net obstacle caches.  The cache for the net currently being routed is
-removed by KRT in the normal way, so a zone remains conductive for its owner
-without becoming hundreds of fake track terminals.
+The router loads this module before every KRT CLI it runs.  Each block is a
+host contract KRT cannot express on its own command line:
+
+* native filled copper written by the host (EasyEDA) is a net-aware obstacle,
+  and KRT's #1260 pour guard reads that same fill instead of a KiCad refill;
+* exact DSL net names, rip authorizations, power nets and differential pairs
+  survive KRT's glob/sheet-leaf selector semantics;
+* per-pad QFN fanout opt-outs;
+* bounded parameters for the explicitly enabled final rescue.
+
+Retired with 0.23.7, because upstream now does it natively:
+
+* ``SHORT_POWER_EDGE_MM = 0`` and the local neck-down/taper rewrite.  KRT
+  #1033 keeps a wide net's width piece by piece (merged back into runs, so a
+  taper spans the whole run), lays a short edge at full width and necks only
+  to the widest width that fits, and #1318 caps the pad-entry zone at the pad
+  instead of narrowing it whole.  Re-applying the old override would both
+  regress that and crash: ``_apply_neckdown_widths`` now takes ``neck_w``,
+  ``end_caps`` and ``pcb_data``.
+
+Every wrapper forwards unknown positional and keyword arguments, so an
+upstream parameter added after 0.23.7 reaches KRT instead of raising.
 """
 
 from __future__ import annotations
@@ -13,10 +29,11 @@ from __future__ import annotations
 import os
 import re
 import sys
-import math
 import copy
 import json
-from typing import Dict, List, Tuple
+import inspect
+from collections import OrderedDict
+from typing import Dict, FrozenSet, List, NamedTuple, Tuple
 
 import numpy as np
 
@@ -29,19 +46,31 @@ from routing_config import DiffPairNet, GridCoord
 from routing_utils import build_layer_map
 
 
-_ORIGINAL_BUILD_BASE = obstacle_map.build_base_obstacle_map
-_ORIGINAL_PRECOMPUTE = obstacle_cache.precompute_net_obstacles
-_CACHE_ATTRIBUTE = "_copilot_router_exact_filled_copper"
-_ROUTER_PLANE_PREFIX = "copilot-router:plane:"
-_ZONE_NAME_RE = re.compile(r'\(name\s+"((?:[^"\\]|\\.)*)"\)')
+def _require_upstream_contract():
+    """Refuse a KRT tree older than the behavior this patch leaves upstream."""
+    missing = []
+    neckdown = inspect.signature(single_ended_routing._apply_neckdown_widths)
+    if "end_caps" not in neckdown.parameters:
+        missing.append("_apply_neckdown_widths(end_caps=...) (#1318)")
+    for module, name in (
+            (single_ended_routing, "_widen_fitting_pieces"),
+            (obstacle_map, "_rasterize_polygon_box"),
+            (obstacle_map, "_box_masked_cells"),
+            (obstacle_cache, "_unique_rows")):
+        if not hasattr(module, name):
+            missing.append(f"{module.__name__}.{name}")
+    try:
+        import pour_guard  # noqa: F401  (#1260)
+    except ImportError:
+        missing.append("pour_guard (#1260)")
+    if missing:
+        raise RuntimeError(
+            "copilot_router_krt_patch requires KiCadRoutingTools >= 0.23.7; "
+            "this tree lacks " + ", ".join(missing)
+        )
 
-# Copilot Router policy: neck-down is always allowed, including short routes.
-# Upstream KRT otherwise treats <=10 mm power/impedance connections as one
-# uniformly narrowed segment, so a legal wide middle can never recover its
-# requested width.  Sending every connection through the normal two-ended
-# neck-down pass keeps dense pad escapes narrow and restores the requested
-# width everywhere the wide swept-copper check succeeds.
-single_ended_routing.SHORT_POWER_EDGE_MM = 0.0
+
+_require_upstream_contract()
 
 
 def _bounded_rescue_default(name, cast, minimum):
@@ -64,244 +93,58 @@ _bounded_rescue_default("RESCUE_MAX_WINDOW_CELLS", int, 10_000)
 _bounded_rescue_default("RESCUE_MAX_EDGES_PER_NET", int, 1)
 _bounded_rescue_default("RESCUE_MAX_ITERATIONS", int, 1_000)
 
-_ORIGINAL_APPLY_NECKDOWN = single_ended_routing._apply_neckdown_widths
-_NECKDOWN_CHECK_INTERVAL_MM = 0.5
-_TAPER_MIN_STEPS = 4
-_TAPER_MAX_STEPS = 16
-_TAPER_LENGTH_STEP_TARGET_MM = 0.1
-_TAPER_WIDTH_STEP_TARGET_MM = 0.25
+
+# ----------------------------------------------------------- filled copper
+#
+# KRT parses zone outlines for connectivity, but its ordinary maze map still
+# does not stamp the actual ``filled_polygon`` copper (0.23.7's pour guard
+# blocks only uncut islands of out-of-scope nets).  The host writes an
+# already-filled board, so its fills augment KRT's existing per-net obstacle
+# caches.  The cache of the net being routed is removed by KRT in the normal
+# way, so a zone stays conductive for its owner without becoming hundreds of
+# fake track terminals.
+
+_ORIGINAL_BUILD_BASE = obstacle_map.build_base_obstacle_map
+_ORIGINAL_PRECOMPUTE = obstacle_cache.precompute_net_obstacles
+_BUILD_BASE_SIGNATURE = inspect.signature(_ORIGINAL_BUILD_BASE)
+_PRECOMPUTE_SIGNATURE = inspect.signature(_ORIGINAL_PRECOMPUTE)
+_CACHE_ATTRIBUTE = "_copilot_router_host_fill"
+_ROUTER_PLANE_PREFIX = "copilot-router:plane:"
+_ZONE_NAME_RE = re.compile(r'\(name\s+"((?:[^"\\]|\\.)*)"\)')
+_EMPTY_CELLS = np.empty((0, 3), dtype=np.int32)
+_EMPTY_VIAS = np.empty((0, 2), dtype=np.int32)
+_ZONE_OBSTACLE_MEMO: "OrderedDict[tuple, tuple]" = OrderedDict()
+_ZONE_OBSTACLE_MEMO_SIZE = 64
 
 
-def _without_neckdown_taper(config):
-    """Return an isolated config clone for the binary wide-fit pass."""
-    clone = copy.copy(config)
-    clone.neckdown_taper_length = 0.0
-    return clone
+class _HostFill(NamedTuple):
+    by_name: Dict[Tuple[str, str], List[list]]
+    by_id: Dict[Tuple[int, str], List[list]]
+    plane_uuids: FrozenSet[str]
+    has_fill: bool
 
 
-def _is_wide(segment, config, net_id):
-    narrow = single_ended_routing._neck_width_for_net(config, net_id, segment.layer)
-    return segment.width > narrow + 1e-9
+def _call_arguments(signature, args, kwargs):
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return bound.arguments
 
 
-def _suppress_short_wide_islands(segments, config, net_id):
-    """Preserve upstream's noise filter while delaying taper construction."""
-    minimum = 2.0 * config.neckdown_taper_length
-    if minimum <= 0:
-        return segments
-    wide = [_is_wide(segment, config, net_id) for segment in segments]
-    index = 0
-    while index < len(segments):
-        if not wide[index]:
-            index += 1
-            continue
-        end = index
-        length = 0.0
-        while end < len(segments) and wide[end]:
-            length += single_ended_routing._seg_length(segments[end])
-            end += 1
-        if index > 0 and end < len(segments) and length <= minimum + 1e-9:
-            for item in range(index, end):
-                segments[item].width = single_ended_routing._neck_width_for_net(
-                    config, net_id, segments[item].layer,
-                )
-                wide[item] = False
-        index = end
-    return segments
+def _parse_host_fills(text: str):
+    """(fills, DSL plane uuids, any fill) from the host-written board.
 
-
-def _collinear_forward(first, second):
-    ax = first.end_x - first.start_x
-    ay = first.end_y - first.start_y
-    bx = second.end_x - second.start_x
-    by = second.end_y - second.start_y
-    scale = max(1.0, math.hypot(ax, ay) * math.hypot(bx, by))
-    return abs(ax * by - ay * bx) <= 1e-9 * scale and ax * bx + ay * by > 0
-
-
-def _merge_collinear_same_width(segments):
-    """Undo sampling splits without crossing a corner, layer, net or width."""
-    merged = []
-    for segment in segments:
-        if merged:
-            previous = merged[-1]
-            connected = (
-                abs(previous.end_x - segment.start_x) <= 1e-9
-                and abs(previous.end_y - segment.start_y) <= 1e-9
-            )
-            compatible = (
-                previous.layer == segment.layer
-                and previous.net_id == segment.net_id
-                and abs(previous.width - segment.width) <= 1e-9
-            )
-            if connected and compatible and _collinear_forward(previous, segment):
-                merged[-1] = single_ended_routing.Segment(
-                    start_x=previous.start_x,
-                    start_y=previous.start_y,
-                    end_x=segment.end_x,
-                    end_y=segment.end_y,
-                    width=previous.width,
-                    layer=previous.layer,
-                    net_id=previous.net_id,
-                )
-                continue
-        merged.append(segment)
-    return merged
-
-
-def _segment_piece(segment, start_fraction, end_fraction, width):
-    dx = segment.end_x - segment.start_x
-    dy = segment.end_y - segment.start_y
-    return single_ended_routing.Segment(
-        start_x=segment.start_x + dx * start_fraction,
-        start_y=segment.start_y + dy * start_fraction,
-        end_x=segment.start_x + dx * end_fraction,
-        end_y=segment.start_y + dy * end_fraction,
-        width=width,
-        layer=segment.layer,
-        net_id=segment.net_id,
-    )
-
-
-def _taper_step_count(length, width_delta):
-    return max(_TAPER_MIN_STEPS, min(
-        _TAPER_MAX_STEPS,
-        int(math.ceil(max(
-            length / _TAPER_LENGTH_STEP_TARGET_MM,
-            width_delta / _TAPER_WIDTH_STEP_TARGET_MM,
-        ))),
-    ))
-
-
-def _taper_wide_segment(segment, narrow_width, taper_length,
-                        narrow_before=False, narrow_after=False):
-    """Carve bounded width steps from the already-proven wide envelope."""
-    length = single_ended_routing._seg_length(segment)
-    if length <= 1e-12 or taper_length <= 0 or not (narrow_before or narrow_after):
-        return [segment]
-
-    sides = int(narrow_before) + int(narrow_after)
-    available_per_side = length / sides
-    used = min(taper_length, available_per_side)
-    if used <= 1e-12:
-        return [segment]
-
-    wide_width = segment.width
-    delta = max(0.0, wide_width - narrow_width)
-    if delta <= 1e-12:
-        return [segment]
-    steps = _taper_step_count(used, delta)
-    start_length = used if narrow_before else 0.0
-    end_length = used if narrow_after else 0.0
-    output = []
-
-    if narrow_before:
-        for index in range(steps):
-            start = (start_length * index / steps) / length
-            end = (start_length * (index + 1) / steps) / length
-            width = narrow_width + delta * (index + 1) / (steps + 1)
-            output.append(_segment_piece(segment, start, end, width))
-
-    body_start = start_length / length
-    body_end = 1.0 - end_length / length
-    if body_end - body_start > 1e-12:
-        output.append(_segment_piece(segment, body_start, body_end, wide_width))
-
-    if narrow_after:
-        for index in range(steps):
-            start = body_end + (end_length * index / steps) / length
-            end = body_end + (end_length * (index + 1) / steps) / length
-            width = wide_width - delta * (index + 1) / (steps + 1)
-            output.append(_segment_piece(segment, start, end, width))
-    return output
-
-
-def _apply_full_run_tapers(segments, config, net_id):
-    if config.neckdown_taper_length <= 0:
-        return segments
-    wide = [_is_wide(segment, config, net_id) for segment in segments]
-    output = []
-    for index, segment in enumerate(segments):
-        if not wide[index]:
-            output.append(segment)
-            continue
-        narrow_before = (
-            index > 0 and not wide[index - 1]
-            and segments[index - 1].layer == segment.layer
-        )
-        narrow_after = (
-            index + 1 < len(segments) and not wide[index + 1]
-            and segments[index + 1].layer == segment.layer
-        )
-        narrow_width = single_ended_routing._neck_width_for_net(
-            config, net_id, segment.layer,
-        )
-        output.extend(_taper_wide_segment(
-            segment,
-            narrow_width,
-            config.neckdown_taper_length,
-            narrow_before=narrow_before,
-            narrow_after=narrow_after,
-        ))
-    return output
-
-
-def _apply_local_neckdown_widths(segments, config, net_id, obstacles, coord,
-                                 layer_names, track_margin, neck_start=False):
-    """Make KRT's wide-fit decision local instead of segment-wide.
-
-    KRT simplifies a straight route into very long segments.  Its native
-    neck-down pass then narrows a whole segment when only a few millimetres at
-    one end collide with a dense pad bank.  Re-segmenting only this fallback
-    path gives the existing swept-copper check enough resolution to restore
-    the requested width in free space.  The later authoritative terminal-graze
-    pass still narrows the pieces touching pads.
+    DSL planes (``copilot-router:plane:*``) are intentionally cuttable: the
+    router pours them again after routing, so they are never obstacles.
     """
-    pieces = []
-    for segment in segments:
-        length = math.hypot(segment.end_x - segment.start_x,
-                            segment.end_y - segment.start_y)
-        count = max(1, int(math.ceil(length / _NECKDOWN_CHECK_INTERVAL_MM)))
-        width = config.get_net_track_width(net_id, segment.layer)
-        for index in range(count):
-            t0 = index / count
-            t1 = (index + 1) / count
-            pieces.append(single_ended_routing.Segment(
-                start_x=segment.start_x + (segment.end_x - segment.start_x) * t0,
-                start_y=segment.start_y + (segment.end_y - segment.start_y) * t0,
-                end_x=segment.start_x + (segment.end_x - segment.start_x) * t1,
-                end_y=segment.start_y + (segment.end_y - segment.start_y) * t1,
-                width=width,
-                layer=segment.layer,
-                net_id=segment.net_id,
-            ))
-    # Upstream constructs its taper immediately. Since every sampling piece is
-    # <=0.5 mm and upstream caps a taper to one third of its host segment, the
-    # nominal 0.5 mm taper collapsed to <=0.1667 mm. First ask upstream only for
-    # its proven binary wide/narrow classification, then restore its short-wide-
-    # island filter, merge sampling cuts, and finally build the taper over the
-    # full available collinear run. Every emitted taper width stays inside the
-    # already-clear wide envelope.
-    classified = _ORIGINAL_APPLY_NECKDOWN(
-        pieces, _without_neckdown_taper(config), net_id, obstacles, coord,
-        layer_names, track_margin,
-        neck_start=neck_start,
-    )
-    classified = _suppress_short_wide_islands(classified, config, net_id)
-    merged = _merge_collinear_same_width(classified)
-    return _apply_full_run_tapers(merged, config, net_id)
+    from kicad_parser import uuid_or_tstamp
 
-
-single_ended_routing._apply_neckdown_widths = _apply_local_neckdown_widths
-
-
-def _parse_obstacle_fills(text: str):
-    """Parse actual fills, excluding intentionally cuttable DSL planes."""
     id_to_name = {
         int(match.group(1)): match.group(2)
         for match in re.finditer(r'\(net\s+(\d+)\s+"((?:[^"\\]|\\.)*)"\)', text)
     }
     output = {}
+    plane_uuids = set()
+    has_fill = False
     position = 0
     while True:
         zone_start = text.find("(zone", position)
@@ -309,9 +152,13 @@ def _parse_obstacle_fills(text: str):
             break
         block, position = kicad_exact_fill._balanced_block(text, zone_start)
         filled_at = block.find("(filled_polygon")
+        has_fill = has_fill or filled_at >= 0
         head = block[:filled_at] if filled_at >= 0 else block
         zone_name = _ZONE_NAME_RE.search(head)
         if zone_name and zone_name.group(1).startswith(_ROUTER_PLANE_PREFIX):
+            outline_at = [index for index in (head.find("(polygon"), head.find("(keepout"))
+                          if index >= 0]
+            plane_uuids.add(uuid_or_tstamp(head[:min(outline_at)] if outline_at else head))
             continue
         name_match = kicad_exact_fill._NET_NAME_RE.search(head) \
             or kicad_exact_fill._NET_STR_RE.search(head)
@@ -337,7 +184,12 @@ def _parse_obstacle_fills(text: str):
             ]
             if len(polygon) >= 3:
                 output.setdefault((net_name, layer_match.group(1)), []).append(polygon)
-    return output
+    return output, frozenset(plane_uuids), has_fill
+
+
+def _parse_obstacle_fills(text: str):
+    """Parse actual fills, excluding intentionally cuttable DSL planes."""
+    return _parse_host_fills(text)[0]
 
 
 def _net_names(pcb_data) -> Tuple[Dict[int, str], Dict[str, int]]:
@@ -349,28 +201,35 @@ def _net_names(pcb_data) -> Tuple[Dict[int, str], Dict[str, int]]:
     return by_id, {name: net_id for net_id, name in by_id.items()}
 
 
-def _filled_copper(pcb_data):
+def _host_fill(pcb_data) -> _HostFill:
     cached = getattr(pcb_data, _CACHE_ATTRIBUTE, None)
     if cached is not None:
         return cached
     provider = getattr(pcb_data, "exact_fill_provider", None)
+    plane_uuids = frozenset()
     if callable(provider):
-        fills = provider()
+        fills = provider() or {}
+        has_fill = bool(fills)
     else:
         path = getattr(pcb_data, "source_path", "") or ""
         if not path or not os.path.isfile(path):
-            fills = {}
+            fills, has_fill = {}, False
         else:
             with open(path, "r", encoding="utf-8") as source:
-                fills = _parse_obstacle_fills(source.read())
-    by_id, by_name = _net_names(pcb_data)
+                fills, plane_uuids, has_fill = _parse_host_fills(source.read())
+    _by_id, by_name = _net_names(pcb_data)
     indexed = {
         (by_name[name], layer): polygons
-        for (name, layer), polygons in (fills or {}).items()
+        for (name, layer), polygons in fills.items()
         if name in by_name and polygons
     }
-    setattr(pcb_data, _CACHE_ATTRIBUTE, indexed)
-    return indexed
+    cached = _HostFill(fills, indexed, plane_uuids, has_fill)
+    setattr(pcb_data, _CACHE_ATTRIBUTE, cached)
+    return cached
+
+
+def _filled_copper(pcb_data):
+    return _host_fill(pcb_data).by_id
 
 
 def _unique(chunks: List[np.ndarray], columns: int) -> np.ndarray:
@@ -380,91 +239,115 @@ def _unique(chunks: List[np.ndarray], columns: int) -> np.ndarray:
     return obstacle_cache._unique_rows(np.concatenate(nonempty).astype(np.int32, copy=False))
 
 
-def _zone_obstacles(pcb_data, net_id: int, config, extra_clearance: float = 0.0):
-    coord = GridCoord(config.grid_step)
+def _zone_obstacles(pcb_data, net_id: int, config, extra_clearance: float = 0.0,
+                    tracks: bool = True):
+    """(track cells, via cells) of one net's filled copper.
+
+    Memoized on the fill object and every resolved margin, because KRT
+    rebuilds base maps and net caches many times per process (rung passes,
+    reconciliation laps, fanout probes).  Each entry holds the fill object
+    itself, so its id cannot be recycled while the entry lives.  The arrays
+    are read-only.
+    """
+    fills = _filled_copper(pcb_data)
+    owned = [(layer, polygons) for (zone_net_id, layer), polygons in fills.items()
+             if zone_net_id == net_id]
+    if not owned:
+        return _EMPTY_CELLS, _EMPTY_VIAS
     layer_map = build_layer_map(config.layers)
     clearance = config.obstacle_clearance(net_id)
+    margins = []
+    for layer, polygons in owned:
+        if layer not in layer_map:
+            continue
+        layer_clearance = config.layer_clearance(layer, clearance) + extra_clearance
+        margins.append((
+            layer,
+            layer_map[layer],
+            config.route_reserve_width(layer) / 2 + layer_clearance,
+            config.via_size / 2 + layer_clearance,
+            polygons,
+        ))
+    clip = getattr(pcb_data.board_info, "board_bounds", None)
+    key = (
+        id(fills), net_id, float(config.grid_step), tuple(config.layers),
+        tuple(clip) if clip else None, tracks,
+        tuple((layer, track, via) for layer, _index, track, via, _polygons in margins),
+    )
+    cached = _ZONE_OBSTACLE_MEMO.get(key)
+    if cached is not None and cached[0] is fills:
+        _ZONE_OBSTACLE_MEMO.move_to_end(key)
+        return cached[1]
+
+    coord = GridCoord(config.grid_step)
     track_chunks: List[np.ndarray] = []
     via_chunks: List[np.ndarray] = []
-    for (zone_net_id, layer), polygons in _filled_copper(pcb_data).items():
-        if zone_net_id != net_id or layer not in layer_map:
-            continue
-        layer_index = layer_map[layer]
-        track_margin = (
-            config.route_reserve_width(layer) / 2
-            + config.layer_clearance(layer, clearance)
-            + extra_clearance
-        )
-        via_margin = (
-            config.via_size / 2
-            + config.layer_clearance(layer, clearance)
-            + extra_clearance
-        )
+    for _layer, layer_index, track_margin, via_margin, polygons in margins:
+        # One margin for both passes, so a via-only rung pass reuses KRT's
+        # polygon raster cache entry from the full pass.
+        margin = max(track_margin, via_margin, config.grid_step)
         for polygon in polygons:
-            margin = max(track_margin, via_margin, config.grid_step)
-            gx, gy, inside, edge_distance = obstacle_map._rasterize_polygon(
-                polygon, coord, margin,
-                clip_bounds=getattr(pcb_data.board_info, "board_bounds", None),
+            gx_lo, gy_lo, nx, _ny, inside, edge_distance = obstacle_map._rasterize_polygon_box(
+                polygon, coord, margin, clip_bounds=clip,
             )
-            if gx is None:
+            if inside is None:
                 continue
-            track_mask = inside | (edge_distance < track_margin)
-            if track_mask.any():
-                layer_column = np.full((int(track_mask.sum()), 1), layer_index, dtype=np.int32)
-                track_chunks.append(np.hstack([
-                    np.column_stack([gx[track_mask], gy[track_mask]]).astype(np.int32),
-                    layer_column,
-                ]))
+            if tracks:
+                track_mask = inside | (edge_distance < track_margin)
+                if track_mask.any():
+                    gx, gy = obstacle_map._box_masked_cells(gx_lo, gy_lo, nx, track_mask)
+                    track_chunks.append(np.column_stack([
+                        gx, gy, np.full(len(gx), layer_index, dtype=np.int32),
+                    ]))
             via_mask = inside | (edge_distance < via_margin)
             if via_mask.any():
-                via_chunks.append(np.column_stack([gx[via_mask], gy[via_mask]]).astype(np.int32))
-    return _unique(track_chunks, 3), _unique(via_chunks, 2)
+                gx, gy = obstacle_map._box_masked_cells(gx_lo, gy_lo, nx, via_mask)
+                via_chunks.append(np.column_stack([gx, gy]))
+    result = (_unique(track_chunks, 3), _unique(via_chunks, 2))
+    for array in result:
+        array.setflags(write=False)
+    _ZONE_OBSTACLE_MEMO[key] = (fills, result)
+    while len(_ZONE_OBSTACLE_MEMO) > _ZONE_OBSTACLE_MEMO_SIZE:
+        _ZONE_OBSTACLE_MEMO.popitem(last=False)
+    return result
 
 
 def _append_rows(current: np.ndarray, extra: np.ndarray, columns: int) -> np.ndarray:
     if not len(extra):
         return current
     if not len(current):
-        return extra
+        return extra.copy()
     return _unique([current, extra], columns)
 
 
-def _precompute_net_obstacles(
-    pcb_data,
-    net_id: int,
-    config,
-    extra_clearance: float = 0.0,
-    diagonal_margin: float = obstacle_cache.defaults.DIAGONAL_MARGIN,
-    _small_pass: bool = False,
-):
-    data = _ORIGINAL_PRECOMPUTE(
-        pcb_data, net_id, config, extra_clearance, diagonal_margin, _small_pass,
+def _precompute_net_obstacles(*args, **kwargs):
+    data = _ORIGINAL_PRECOMPUTE(*args, **kwargs)
+    call = _call_arguments(_PRECOMPUTE_SIGNATURE, args, kwargs)
+    # KRT's small/per-net via rungs recurse through this wrapper with
+    # _small_pass=True and keep only blocked_vias, so the fill reaches
+    # blocked_vias_small and blocked_vias_rungs at each rung's own via size.
+    small_pass = bool(call.get("_small_pass", False))
+    cells, vias = _zone_obstacles(
+        call["pcb_data"], call["net_id"], call["config"],
+        call.get("extra_clearance", 0.0), tracks=not small_pass,
     )
-    cells, vias = _zone_obstacles(pcb_data, net_id, config, extra_clearance)
-    data.blocked_cells = _append_rows(data.blocked_cells, cells, 3)
+    if not small_pass:
+        data.blocked_cells = _append_rows(data.blocked_cells, cells, 3)
     data.blocked_vias = _append_rows(data.blocked_vias, vias, 2)
     return data
 
 
-def _build_base_obstacle_map(
-    pcb_data,
-    config,
-    nets_to_route,
-    extra_clearance: float = 0.0,
-    net_clearances=None,
-    static_base: bool = False,
-    progress_callback=None,
-):
-    result = _ORIGINAL_BUILD_BASE(
-        pcb_data,
-        config,
-        nets_to_route,
-        extra_clearance,
-        net_clearances,
-        static_base,
-        progress_callback,
-    )
-    routed = set(nets_to_route or [])
+def _build_base_obstacle_map(*args, **kwargs):
+    result = _ORIGINAL_BUILD_BASE(*args, **kwargs)
+    call = _call_arguments(_BUILD_BASE_SIGNATURE, args, kwargs)
+    pcb_data = call["pcb_data"]
+    config = call["config"]
+    extra_clearance = call.get("extra_clearance", 0.0)
+    static_base = bool(call.get("static_base", False))
+    # A via-rung sub-build (#530) contributes only its via cells to the
+    # parent map's rung, so skip the track stamps there.
+    tracks = not call.get("_rung_pass", False)
+    routed = set(call.get("nets_to_route") or [])
     net_ids = sorted({net_id for net_id, _layer in _filled_copper(pcb_data) if net_id not in routed})
     add_cells = (
         result.add_static_blocked_cells_batch
@@ -477,7 +360,7 @@ def _build_base_obstacle_map(
         else result.add_blocked_vias_batch
     )
     for net_id in net_ids:
-        cells, vias = _zone_obstacles(pcb_data, net_id, config, extra_clearance)
+        cells, vias = _zone_obstacles(pcb_data, net_id, config, extra_clearance, tracks=tracks)
         if len(cells):
             add_cells(cells)
         if len(vias):
@@ -488,6 +371,59 @@ def _build_base_obstacle_map(
 obstacle_cache.precompute_net_obstacles = _precompute_net_obstacles
 obstacle_map.build_base_obstacle_map = _build_base_obstacle_map
 
+
+def _install_pour_guard_host_fill():
+    """Feed KRT's #1260 pour guard the fill the host actually poured.
+
+    Upstream asks a live pcbnew or a KiCad refill for the exact fill, and
+    without KiCad (every EasyEDA host) it blocks the whole zone OUTLINE,
+    which covers clearance gaps and removed islands too.  The host-written
+    ``filled_polygon`` blocks are the same copper this patch stamps as
+    obstacles.  DSL planes stay crossable, as everywhere else in the router.
+    A static zone the host left unfilled keeps upstream's fallback.
+    """
+    import pour_guard
+    from kicad_parser import pour_zones
+
+    original = pour_guard.fill_islands
+
+    def fill_islands(pcb_data, wanted, *args, **kwargs):
+        if getattr(pcb_data, "exact_fill_provider", None) is not None:
+            return original(pcb_data, wanted, *args, **kwargs)
+        host = _host_fill(pcb_data)
+        if not host.has_fill:
+            return original(pcb_data, wanted, *args, **kwargs)
+        islands = {}
+        fallback = {}
+        for key in wanted:
+            polygons = host.by_name.get(key)
+            if polygons:
+                islands[key] = [list(polygon) for polygon in polygons]
+                continue
+            outlines = [
+                list(zone.polygon) for zone in pour_zones(pcb_data.zones)
+                if zone.layer == key[1] and len(zone.polygon or ()) >= 3
+                and zone.uuid not in host.plane_uuids
+                and pour_guard._zone_net_name(pcb_data, zone) == key[0]
+            ]
+            if outlines:
+                fallback[key] = outlines
+            else:
+                islands[key] = []
+        source, why = "copilot_host_fill", ""
+        if fallback:
+            extra, fallback_source, why = original(pcb_data, fallback, *args, **kwargs)
+            islands.update(extra)
+            source = f"{source}+{fallback_source}"
+        return islands, source, why
+
+    pour_guard.fill_islands = fill_islands
+
+
+_install_pour_guard_host_fill()
+
+
+# ------------------------------------------------------- differential pairs
 
 _EXPLICIT_DIFF_PAIRS_ENV = "COPILOT_ROUTER_DIFF_PAIRS"
 
@@ -554,8 +490,11 @@ def _install_explicit_diff_pairs():
     import net_queries
 
     original = net_queries.find_differential_pairs
+    # 0.23.7's route_diff asks once per concern (#1293 coupled floors,
+    # layer-scoped widths, the route itself); announce each pairing once.
+    announced = set()
 
-    def find_differential_pairs(pcb_data, patterns):
+    def find_differential_pairs(pcb_data, patterns, *args, **kwargs):
         selected = {str(pattern) for pattern in (patterns or [])}
         # One invocation may legitimately select only one unrelated matched or
         # repair member while the authoritative sidecar describes every pair
@@ -567,7 +506,7 @@ def _install_explicit_diff_pairs():
             if pair[0] in selected and pair[1] in selected
         ]
         if not applicable_pairs:
-            return original(pcb_data, patterns)
+            return original(pcb_data, patterns, *args, **kwargs)
 
         explicit_members = {name for pair in applicable_pairs for name in pair}
 
@@ -593,14 +532,19 @@ def _install_explicit_diff_pairs():
                 p_net_name=positive,
                 n_net_name=negative,
             )
-        print(
-            f"Using {len(output)} explicit differential pair(s) from "
-            f"{source}"
-        )
+        signature = tuple(applicable_pairs)
+        if signature not in announced:
+            announced.add(signature)
+            print(
+                f"Using {len(output)} explicit differential pair(s) from "
+                f"{source}"
+            )
         return output
 
     net_queries.find_differential_pairs = find_differential_pairs
 
+
+# ------------------------------------------------------------- QFN fanout
 
 def _install_qfn_pad_allowlist():
     """Keep QFN geometry intact while suppressing explicitly excluded pads.
@@ -609,11 +553,16 @@ def _install_qfn_pad_allowlist():
     needs both component- and pad-level fanout opt-outs, so the adapter passes a
     JSON allowlist.  Disabled pads retain their physical geometry for layout
     analysis and collision checks; only their copied net identity is cleared.
+
+    0.23.7's qfn_fanout CLI grades ``unescaped_nets`` with
+    ``bga_fanout.unserved_nets`` on the board's own footprint, so the same
+    filtered view goes there too: an excluded pad is not owed copper.
     """
     raw = os.environ.get("COPILOT_ROUTER_QFN_PAD_ALLOWLIST")
     if not raw:
         return
     import qfn_fanout
+    import bga_fanout
 
     parsed = json.loads(raw)
     allowlists = {
@@ -621,12 +570,11 @@ def _install_qfn_pad_allowlist():
         for component, numbers in parsed.items()
         if isinstance(numbers, list)
     }
-    original = qfn_fanout.generate_qfn_fanout
 
-    def filtered(footprint, pcb_data, *args, **kwargs):
+    def allowed_view(footprint):
         allowed = allowlists.get(str(getattr(footprint, "reference", "")))
         if allowed is None:
-            return original(footprint, pcb_data, *args, **kwargs)
+            return footprint
         filtered_footprint = copy.copy(footprint)
         filtered_footprint.pads = []
         for source_pad in footprint.pads:
@@ -635,10 +583,22 @@ def _install_qfn_pad_allowlist():
                 pad.net_id = 0
                 pad.net_name = ""
             filtered_footprint.pads.append(pad)
-        return original(filtered_footprint, pcb_data, *args, **kwargs)
+        return filtered_footprint
 
-    qfn_fanout.generate_qfn_fanout = filtered
+    original_generate = qfn_fanout.generate_qfn_fanout
+    original_unserved = bga_fanout.unserved_nets
 
+    def generate_qfn_fanout(footprint, *args, **kwargs):
+        return original_generate(allowed_view(footprint), *args, **kwargs)
+
+    def unserved_nets(footprint, *args, **kwargs):
+        return original_unserved(allowed_view(footprint), *args, **kwargs)
+
+    qfn_fanout.generate_qfn_fanout = generate_qfn_fanout
+    bga_fanout.unserved_nets = unserved_nets
+
+
+# ---------------------------------------------------------- exact selectors
 
 _EXACT_SELECTORS_FILE_ENV = "COPILOT_ROUTER_EXACT_SELECTORS_FILE"
 _EXACT_NET_SENTINEL = "__COPILOT_ROUTER_EXACT_NET_SCOPE_V1__"
@@ -788,8 +748,8 @@ def _install_exact_rip_overrides():
     import protected_nets
     original = protected_nets.exact_names
 
-    def exact_names(patterns):
-        return set(original(patterns)) | authorized
+    def exact_names(patterns, *args, **kwargs):
+        return set(original(patterns, *args, **kwargs)) | authorized
 
     protected_nets.exact_names = exact_names
 
@@ -907,6 +867,7 @@ def _install_exact_net_selection():
     import net_queries
     original_expand = net_queries.expand_net_patterns
     original_matches = net_queries.matches_net_filter
+    original_power = net_queries.identify_power_nets
 
     missing = object()
     resolve_cache = {}
@@ -956,22 +917,46 @@ def _install_exact_net_selection():
         available_cache[key] = (pcb_data, frozen)
         return frozen
 
-    def expand_net_patterns(pcb_data, patterns, exclude_unconnected=True):
+    def expand_net_patterns(pcb_data, patterns, *args, **kwargs):
         exact = exact_or_native(patterns, "net")
         if exact is None:
-            return original_expand(pcb_data, patterns, exclude_unconnected)
+            return original_expand(pcb_data, patterns, *args, **kwargs)
         ordered, exact_set = exact
         absent = sorted(exact_set.difference(available_names(pcb_data)))
         if absent:
             raise RuntimeError("Exact host net selector is absent from the PCB: " + ", ".join(absent))
         return list(ordered)
 
-    def matches_net_filter(net_name, patterns):
+    def matches_net_filter(net_name, patterns, *args, **kwargs):
         exact = exact_or_native(patterns, "net filter")
-        return net_name in exact[1] if exact is not None else original_matches(net_name, patterns)
+        if exact is None:
+            return original_matches(net_name, patterns, *args, **kwargs)
+        return net_name in exact[1]
+
+    def identify_power_nets(pcb_data, patterns, widths, *args, **kwargs):
+        # The adapter sends --power-nets as opaque exact tokens, which
+        # upstream's plain fnmatch never matches: every power width was
+        # silently dropped.  Resolve each token to its literal name, keeping
+        # upstream's first-pattern-wins order.
+        if exact_or_native(patterns, "power-net") is None:
+            return original_power(pcb_data, patterns, widths, *args, **kwargs)
+        if len(patterns) != len(widths):
+            raise ValueError(
+                f"patterns ({len(patterns)}) and widths ({len(widths)}) must have same length"
+            )
+        width_by_name = {}
+        for pattern, width in zip(patterns, widths):
+            for name in resolve((pattern,))[0]:
+                width_by_name.setdefault(name, width)
+        return {
+            net_id: width_by_name[net.name]
+            for net_id, net in pcb_data.nets.items()
+            if net_id != 0 and getattr(net, "name", None) in width_by_name
+        }
 
     net_queries.expand_net_patterns = expand_net_patterns
     net_queries.matches_net_filter = matches_net_filter
+    net_queries.identify_power_nets = identify_power_nets
 
     # Length matching has its own glob matcher and routing_common imports it
     # into a module-local alias.  Resolve the same opaque selector tokens here
@@ -979,10 +964,10 @@ def _install_exact_net_selection():
     import length_matching
     original_length_match_finder = length_matching.find_nets_matching_patterns
 
-    def find_nets_matching_patterns(all_net_names, patterns):
+    def find_nets_matching_patterns(all_net_names, patterns, *args, **kwargs):
         exact = exact_or_native(patterns, "length-match")
         if exact is None:
-            return original_length_match_finder(all_net_names, patterns)
+            return original_length_match_finder(all_net_names, patterns, *args, **kwargs)
         ordered, _exact_set = exact
         available = frozenset(str(name) for name in all_net_names)
         # Unlike expand_net_patterns(), this matcher receives a dynamic
@@ -999,13 +984,29 @@ def _install_exact_net_selection():
         return [name for name in ordered if name in available]
 
     length_matching.find_nets_matching_patterns = find_nets_matching_patterns
-    # Rebind aliases in modules that may have imported the original before
-    # this patch. Modules imported later receive the patched attribute from
-    # length_matching normally.
-    for module_name in ("routing_common", "route"):
-        module = sys.modules.get(module_name)
-        if module is not None and hasattr(module, "find_nets_matching_patterns"):
-            module.find_nets_matching_patterns = find_nets_matching_patterns
+    # Rebind aliases in modules that imported the originals before this
+    # patch. Modules imported later receive the patched attributes normally.
+    rebound = {
+        "expand_net_patterns": expand_net_patterns,
+        "matches_net_filter": matches_net_filter,
+        "identify_power_nets": identify_power_nets,
+        "find_nets_matching_patterns": find_nets_matching_patterns,
+    }
+    originals = {
+        "expand_net_patterns": original_expand,
+        "matches_net_filter": original_matches,
+        "identify_power_nets": original_power,
+        "find_nets_matching_patterns": original_length_match_finder,
+    }
+    for module_name, module in list(sys.modules.items()):
+        # The namespace itself, never getattr: a lazy module's __getattr__
+        # (scipy's) must not import anything on our behalf.
+        namespace = getattr(module, "__dict__", None)
+        if namespace is None or module_name in ("net_queries", "length_matching"):
+            continue
+        for name, replacement in rebound.items():
+            if namespace.get(name) is originals[name]:
+                namespace[name] = replacement
 
 
 _install_exact_net_selection()

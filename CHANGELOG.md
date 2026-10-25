@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Upgrade the managed KiCadRoutingTools release to 0.23.7 with verified archive
+  metadata. The packaged KRT patch now requires 0.23.7 and refuses older trees.
+- Retire the patch's short-power-edge and local neck-down/taper overrides:
+  KRT 0.23.7 widens back piece by piece and caps pad-entry necks natively
+  (#1033, #1318), and the old override raised TypeError on its new arguments.
+- Make the filled-zone obstacle wrappers signature-agnostic, fixing TypeError
+  on 0.23.7's `stamp_pads=False` fanout maps and via-rung sub-builds, and
+  memoize per-net fill rasters across KRT's repeated map builds.
+- Feed KRT's #1260 pour guard the host-written fill instead of a KiCad refill
+  or zone outlines, and keep DSL planes crossable there as everywhere else.
+- Resolve exact `--power-nets` tokens in `identify_power_nets`; requested
+  power widths were previously dropped whenever exact selectors were active.
+- Apply the QFN pad allowlist to 0.23.7's `unescaped_nets` accounting, so an
+  excluded pad is no longer reported as an unescaped net.
+
 ## 0.3.2 - 2026-09-19
 
 - EasyEDA WASM now skips differential pairs that are already fully connected,

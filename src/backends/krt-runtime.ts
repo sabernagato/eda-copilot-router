@@ -23,7 +23,7 @@ import {
   type RouterAssetPolicy,
 } from "./assets.js"
 
-export const KRT_MANAGED_VERSION = "0.22.0"
+export const KRT_MANAGED_VERSION = "0.23.7"
 export const MANAGED_PYTHON_VERSION = "3.12.14-20260814"
 
 const KRT_REQUIRED_CAPABILITIES = Object.freeze([
@@ -58,9 +58,9 @@ const MANAGED_PYTHON_ASSETS = Object.freeze({
 const KRT_RELEASE = Object.freeze({
   backend: "krt",
   version: KRT_MANAGED_VERSION,
-  url: "https://github.com/drandyhaas/KiCadRoutingTools/releases/download/v0.22.0/KiCadRoutingTools-0.22.0.zip",
-  sha256: "75df60b82df577f5087be07ff07b3ef1b867c362ba57da8ad347c1f6a5f2f66e",
-  sizeBytes: 7_467_221,
+  url: "https://github.com/drandyhaas/KiCadRoutingTools/releases/download/v0.23.7/KiCadRoutingTools-0.23.7.zip",
+  sha256: "0a1bc62d0650deca9ab27d5fd04dfc0ac78931cce07976da7027db0c777d8eed",
+  sizeBytes: 15_620_390,
   archive: "zip" as const,
   rootDirectory: "plugins",
   markers: [
@@ -163,7 +163,7 @@ export async function discoverKrtOverride(explicit?: string) {
     if (await validKrtDirectory(candidate)) return candidate
     throw new RouterAssetError(
       "KRT_OVERRIDE_INVALID",
-      "The configured KRT development override does not satisfy the KRT 0.22.0 route, fanout, summary, and capability module contract.",
+      `The configured KRT development override does not satisfy the KRT ${KRT_MANAGED_VERSION} route, fanout, summary, and capability module contract.`,
       { directory: candidate },
     )
   }

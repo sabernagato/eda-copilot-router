@@ -2,12 +2,12 @@
 
 ## Authority
 
-The managed backend uses KiCadRoutingTools `v0.22.0`. KRT owns path search,
+The managed backend uses KiCadRoutingTools `v0.23.7`. KRT owns path search,
 blocker selection, rip-up/reconciliation, net rescue and terminal escalation.
 The router core owns DSL semantics, compiled hard rules, protected-net custody,
 candidate selection and partial-result application.
 
-KRT 0.22.0 resolves `--clearance` as the run's Default-class value. Ordinary
+KRT 0.23.7 resolves `--clearance` as the run's Default-class value. Ordinary
 and matched-ordinary calls omit it and inherit the materialized project rules;
 special calls pass their compiled value. The adapter never passes the new
 `--clearance-ceiling`, which would cap stricter classes. Every stage retains
